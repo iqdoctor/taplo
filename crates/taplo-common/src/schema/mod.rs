@@ -194,12 +194,27 @@ impl<E: Environment> Schemas<E> {
             return Ok(s);
         }
 
+        if self.cache.recently_failed(schema_url) {
+            tracing::debug!(%schema_url, "skipping schema fetch due to recent failure");
+
+            if let Ok(s) = self.cache.load(schema_url, true).await {
+                tracing::debug!(%schema_url, "expired schema was found in cache");
+                return Ok(s);
+            }
+
+            return Err(anyhow!("schema fetch recently failed"));
+        }
+
         let schema = if let Some(builtin) = builtin_schema(schema_url) {
             builtin
         } else {
             match self.fetch_external(schema_url).await {
-                Ok(s) => Arc::new(s),
+                Ok(s) => {
+                    self.cache.clear_failure(schema_url);
+                    Arc::new(s)
+                }
                 Err(error) => {
+                    self.cache.remember_failure(schema_url.clone());
                     tracing::warn!(%error, "failed to fetch schema");
                     if let Ok(s) = self.cache.load(schema_url, true).await {
                         tracing::debug!(%schema_url, "expired schema was found in cache");
@@ -291,6 +306,134 @@ impl<E: Environment> Schemas<E> {
             )?),
             scheme => Err(anyhow!("the scheme `{scheme}` is not supported")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Schemas;
+    use crate::environment::Environment;
+    use async_trait::async_trait;
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    use time::OffsetDateTime;
+    use tokio::io::{empty, sink, Empty, Sink};
+    use url::Url;
+
+    #[derive(Clone, Default)]
+    struct TestEnvironment {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl TestEnvironment {
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Environment for TestEnvironment {
+        type Stdin = Empty;
+        type Stdout = Sink;
+        type Stderr = Sink;
+
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::now_utc()
+        }
+
+        fn spawn<F>(&self, fut: F)
+        where
+            F: futures::Future + Send + 'static,
+            F::Output: Send,
+        {
+            drop(tokio::spawn(fut));
+        }
+
+        fn spawn_local<F>(&self, _fut: F)
+        where
+            F: futures::Future + 'static,
+        {
+            panic!("spawn_local is not used in this test");
+        }
+
+        fn env_var(&self, _name: &str) -> Option<String> {
+            None
+        }
+
+        fn env_vars(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+
+        fn atty_stderr(&self) -> bool {
+            false
+        }
+
+        fn stdin(&self) -> Self::Stdin {
+            empty()
+        }
+
+        fn stdout(&self) -> Self::Stdout {
+            sink()
+        }
+
+        fn stderr(&self) -> Self::Stderr {
+            sink()
+        }
+
+        fn glob_files(&self, _glob: &str) -> Result<Vec<PathBuf>, anyhow::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn read_file(&self, _path: &Path) -> Result<Vec<u8>, anyhow::Error> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(br#"not json"#.to_vec())
+        }
+
+        async fn write_file(&self, _path: &Path, _bytes: &[u8]) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        fn to_file_path(&self, url: &Url) -> Option<PathBuf> {
+            url.to_file_path().ok()
+        }
+
+        fn is_absolute(&self, path: &Path) -> bool {
+            path.is_absolute()
+        }
+
+        fn cwd(&self) -> Option<PathBuf> {
+            None
+        }
+
+        async fn find_config_file(&self, _from: &Path) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    #[test]
+    fn recent_schema_failures_are_not_refetched() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let env = TestEnvironment::default();
+            let client = reqwest::Client::builder().build().unwrap();
+            let schemas = Schemas::new(env.clone(), client);
+            let schema_url = Url::parse("file:///tmp/invalid-schema.json").unwrap();
+
+            assert!(schemas.load_schema(&schema_url).await.is_err());
+            assert_eq!(env.read_count(), 1);
+
+            assert!(schemas.load_schema(&schema_url).await.is_err());
+            assert_eq!(env.read_count(), 1);
+        });
     }
 }
 
