@@ -1,5 +1,5 @@
 use self::{associations::SchemaAssociations, builtins::builtin_schema, cache::Cache};
-use crate::{environment::Environment, util::ArcHashValue, LruCache};
+use crate::{environment::Environment, util::ArcHashValue, HashMap, LruCache};
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -15,7 +15,7 @@ use taplo::{
     rowan::TextRange,
 };
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use url::Url;
 
 pub mod associations;
@@ -49,6 +49,8 @@ pub struct Schemas<E: Environment> {
     env: E,
     associations: SchemaAssociations<E>,
     concurrent_requests: Arc<Semaphore>,
+    in_flight_remote_fetches:
+        Arc<Mutex<HashMap<Url, watch::Sender<Option<InFlightRemoteFetchResult>>>>>,
     http: reqwest::Client,
     validators: Arc<Mutex<LruCache<Url, Arc<JSONSchema>>>>,
     cache: Cache<E>,
@@ -63,6 +65,7 @@ impl<E: Environment> Schemas<E> {
             cache,
             env,
             concurrent_requests: Arc::new(Semaphore::new(10)),
+            in_flight_remote_fetches: Arc::new(Mutex::new(HashMap::default())),
             http,
             validators: Arc::new(Mutex::new(LruCache::with_hasher(
                 NonZeroUsize::new(3).unwrap(),
@@ -194,7 +197,9 @@ impl<E: Environment> Schemas<E> {
             return Ok(s);
         }
 
-        if self.cache.recently_failed(schema_url) {
+        let use_remote_failure_controls = matches!(schema_url.scheme(), "http" | "https");
+
+        if use_remote_failure_controls && self.cache.recently_failed(schema_url) {
             tracing::debug!(%schema_url, "skipping schema fetch due to recent failure");
 
             if let Ok(s) = self.cache.load(schema_url, true).await {
@@ -205,24 +210,69 @@ impl<E: Environment> Schemas<E> {
             return Err(anyhow!("schema fetch recently failed"));
         }
 
-        let schema = if let Some(builtin) = builtin_schema(schema_url) {
-            builtin
-        } else {
-            match self.fetch_external(schema_url).await {
-                Ok(s) => {
-                    self.cache.clear_failure(schema_url);
-                    Arc::new(s)
+        if use_remote_failure_controls {
+            if let Some(mut completion) = self.join_in_flight_remote_fetch(schema_url) {
+                let _ = completion.changed().await;
+
+                match completion.borrow().clone() {
+                    Some(Ok(schema)) => {
+                        tracing::debug!(%schema_url, "schema fetch completed in another task");
+                        return Ok(schema);
+                    }
+                    Some(Err(error)) => return Err(anyhow!(error)),
+                    None => {}
                 }
-                Err(error) => {
-                    self.cache.remember_failure(schema_url.clone());
-                    tracing::warn!(%error, "failed to fetch schema");
+
+                if self.cache.recently_failed(schema_url) {
+                    tracing::debug!(%schema_url, "schema fetch failed while waiting on another task");
+
                     if let Ok(s) = self.cache.load(schema_url, true).await {
                         tracing::debug!(%schema_url, "expired schema was found in cache");
                         return Ok(s);
                     }
-                    return Err(error);
+
+                    return Err(anyhow!("schema fetch recently failed"));
                 }
             }
+        }
+
+        let _in_flight_remote_fetch = use_remote_failure_controls
+            .then(|| InFlightRemoteFetchGuard::new(self, schema_url.clone()));
+
+        let schema = if let Some(builtin) = builtin_schema(schema_url) {
+            builtin
+        } else {
+            let schema = match self.fetch_external(schema_url).await {
+                Ok(s) => {
+                    if use_remote_failure_controls {
+                        self.cache.clear_failure(schema_url);
+                    }
+                    Arc::new(s)
+                }
+                Err(error) => {
+                    if use_remote_failure_controls {
+                        self.cache.remember_failure(schema_url.clone());
+                    }
+                    tracing::warn!(%error, "failed to fetch schema");
+                    if let Ok(s) = self.cache.load(schema_url, true).await {
+                        tracing::debug!(%schema_url, "expired schema was found in cache");
+                        if use_remote_failure_controls {
+                            self.publish_in_flight_remote_fetch(schema_url, Ok(s.clone()));
+                        }
+                        return Ok(s);
+                    }
+                    if use_remote_failure_controls {
+                        self.publish_in_flight_remote_fetch(schema_url, Err(error.to_string()));
+                    }
+                    return Err(error);
+                }
+            };
+
+            if use_remote_failure_controls {
+                self.publish_in_flight_remote_fetch(schema_url, Ok(schema.clone()));
+            }
+
+            schema
         };
 
         if let Err(error) = self.cache.store(schema_url.clone(), schema.clone()).await {
@@ -230,6 +280,32 @@ impl<E: Environment> Schemas<E> {
         }
 
         Ok(schema)
+    }
+
+    fn join_in_flight_remote_fetch(
+        &self,
+        schema_url: &Url,
+    ) -> Option<watch::Receiver<Option<InFlightRemoteFetchResult>>> {
+        let mut in_flight = self.in_flight_remote_fetches.lock();
+
+        match in_flight.get(schema_url) {
+            Some(completion) => Some(completion.subscribe()),
+            None => {
+                let (completion, _) = watch::channel(None);
+                in_flight.insert(schema_url.clone(), completion);
+                None
+            }
+        }
+    }
+
+    fn publish_in_flight_remote_fetch(&self, schema_url: &Url, result: InFlightRemoteFetchResult) {
+        if let Some(completion) = self.in_flight_remote_fetches.lock().get(schema_url) {
+            completion.send_replace(Some(result));
+        }
+    }
+
+    fn finish_in_flight_remote_fetch(&self, schema_url: &Url) {
+        self.in_flight_remote_fetches.lock().remove(schema_url);
     }
 
     fn get_validator(&self, schema_url: &Url) -> Option<Arc<JSONSchema>> {
@@ -309,11 +385,34 @@ impl<E: Environment> Schemas<E> {
     }
 }
 
+type InFlightRemoteFetchResult = Result<Arc<Value>, String>;
+
+struct InFlightRemoteFetchGuard<'a, E: Environment> {
+    schemas: &'a Schemas<E>,
+    schema_url: Url,
+}
+
+impl<'a, E: Environment> InFlightRemoteFetchGuard<'a, E> {
+    fn new(schemas: &'a Schemas<E>, schema_url: Url) -> Self {
+        Self {
+            schemas,
+            schema_url,
+        }
+    }
+}
+
+impl<E: Environment> Drop for InFlightRemoteFetchGuard<'_, E> {
+    fn drop(&mut self) {
+        self.schemas.finish_in_flight_remote_fetch(&self.schema_url);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Schemas;
     use crate::environment::Environment;
     use async_trait::async_trait;
+    use futures::future;
     use std::{
         path::{Path, PathBuf},
         sync::{
@@ -322,7 +421,11 @@ mod tests {
         },
     };
     use time::OffsetDateTime;
-    use tokio::io::{empty, sink, Empty, Sink};
+    use tokio::{
+        io::{empty, sink, AsyncReadExt, AsyncWriteExt, Empty, Sink},
+        net::TcpListener,
+        time::{sleep, timeout, Duration},
+    };
     use url::Url;
 
     #[derive(Clone, Default)]
@@ -415,8 +518,125 @@ mod tests {
         }
     }
 
+    async fn start_invalid_schema_server(request_count: Arc<AtomicUsize>) -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                request_count.fetch_add(1, Ordering::SeqCst);
+
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let response = concat!(
+                        "HTTP/1.1 403 Forbidden\r\n",
+                        "content-type: text/plain\r\n",
+                        "content-length: 8\r\n",
+                        "connection: close\r\n",
+                        "\r\n",
+                        "not json",
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        Url::parse(&format!("http://{addr}/schema.json")).unwrap()
+    }
+
+    async fn start_cancellation_schema_server(request_count: Arc<AtomicUsize>) -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for request_index in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                request_count.fetch_add(1, Ordering::SeqCst);
+
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+
+                    if request_index == 0 {
+                        future::pending::<()>().await;
+                    } else {
+                        let response = concat!(
+                            "HTTP/1.1 403 Forbidden\r\n",
+                            "content-type: text/plain\r\n",
+                            "content-length: 8\r\n",
+                            "connection: close\r\n",
+                            "\r\n",
+                            "not json",
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        Url::parse(&format!("http://{addr}/schema.json")).unwrap()
+    }
+
     #[test]
-    fn recent_schema_failures_are_not_refetched() {
+    fn recent_remote_schema_failures_are_not_refetched() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let env = TestEnvironment::default();
+            let client = reqwest::Client::builder().build().unwrap();
+            let schemas = Schemas::new(env.clone(), client);
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let schema_url = start_invalid_schema_server(request_count.clone()).await;
+
+            assert!(schemas.load_schema(&schema_url).await.is_err());
+            assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+            assert!(schemas.load_schema(&schema_url).await.is_err());
+            assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn recent_remote_schema_failures_are_coalesced_across_concurrent_requests() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let env = TestEnvironment::default();
+            let client = reqwest::Client::builder().build().unwrap();
+            let schemas = Schemas::new(env, client);
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let schema_url = start_invalid_schema_server(request_count.clone()).await;
+
+            let (left, right) = future::join(
+                schemas.load_schema(&schema_url),
+                schemas.load_schema(&schema_url),
+            )
+            .await;
+
+            assert!(left.is_err());
+            assert!(right.is_err());
+            assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn local_file_schema_failures_are_retried() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -432,8 +652,60 @@ mod tests {
             assert_eq!(env.read_count(), 1);
 
             assert!(schemas.load_schema(&schema_url).await.is_err());
-            assert_eq!(env.read_count(), 1);
+            assert_eq!(env.read_count(), 2);
         });
+    }
+
+    #[test]
+    fn canceled_remote_fetch_unblocks_waiters() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let local = tokio::task::LocalSet::new();
+
+        runtime.block_on(local.run_until(async {
+            let env = TestEnvironment::default();
+            let client = reqwest::Client::builder().build().unwrap();
+            let schemas = Schemas::new(env, client);
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let schema_url = start_cancellation_schema_server(request_count.clone()).await;
+
+            let leader_schemas = schemas.clone();
+            let leader_url = schema_url.clone();
+            let leader =
+                tokio::task::spawn_local(
+                    async move { leader_schemas.load_schema(&leader_url).await },
+                );
+
+            timeout(Duration::from_secs(1), async {
+                while request_count.load(Ordering::SeqCst) < 1 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let waiter_schemas = schemas.clone();
+            let waiter_url = schema_url.clone();
+            let waiter = tokio::task::spawn_local(async move {
+                timeout(
+                    Duration::from_secs(1),
+                    waiter_schemas.load_schema(&waiter_url),
+                )
+                .await
+            });
+
+            sleep(Duration::from_millis(50)).await;
+            leader.abort();
+
+            let leader_result = leader.await;
+            let waiter_result = waiter.await.unwrap().unwrap();
+            assert!(leader_result.is_err());
+            assert!(waiter_result.is_err());
+            assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        }));
     }
 }
 
